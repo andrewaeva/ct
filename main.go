@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -21,8 +20,98 @@ import (
 	"time"
 
 	"github.com/labstack/gommon/log"
-	elastic "gopkg.in/olivere/elastic.v5"
 )
+
+func Merge(dest interface{}, src interface{}) error {
+	vSrc := reflect.ValueOf(src)
+
+	vDst := reflect.ValueOf(dest)
+	if vDst.Kind() == reflect.Ptr {
+		vDst = vDst.Elem()
+	}
+	return merge(vDst, vSrc)
+}
+
+func merge(dest reflect.Value, src reflect.Value) error {
+	switch src.Kind() {
+	case reflect.Func:
+		if !dest.CanSet() {
+			return nil
+		}
+		src = src.Call([]reflect.Value{})[0]
+		if src.Kind() == reflect.Ptr {
+			src = src.Elem()
+		}
+		if err := merge(dest, src); err != nil {
+			return err
+		}
+	case reflect.Struct:
+		// try to set the struct
+		if src.Type() == dest.Type() {
+			if !dest.CanSet() {
+				return nil
+			}
+
+			dest.Set(src)
+			return nil
+		}
+
+		for i := 0; i < src.NumMethod(); i++ {
+			tMethod := src.Type().Method(i)
+
+			df := dest.FieldByName(tMethod.Name)
+			if df.Kind() == 0 {
+				continue
+			}
+
+			if err := merge(df, src.Method(i)); err != nil {
+				return err
+			}
+		}
+
+		for i := 0; i < src.NumField(); i++ {
+			tField := src.Type().Field(i)
+
+			df := dest.FieldByName(tField.Name)
+			if df.Kind() == 0 {
+				continue
+			}
+
+			if err := merge(df, src.Field(i)); err != nil {
+				return err
+			}
+		}
+
+	case reflect.Map:
+		x := reflect.MakeMap(dest.Type())
+		for _, k := range src.MapKeys() {
+			x.SetMapIndex(k, src.MapIndex(k))
+		}
+		dest.Set(x)
+	case reflect.Slice:
+		x := reflect.MakeSlice(dest.Type(), src.Len(), src.Len())
+		for j := 0; j < src.Len(); j++ {
+			merge(x.Index(j), src.Index(j))
+		}
+		dest.Set(x)
+	case reflect.Chan:
+	case reflect.Ptr:
+		if !src.IsNil() && dest.CanSet() {
+			fmt.Println(src.Type().Name())
+			fmt.Println(dest.Type().Name())
+			x := reflect.New(dest.Type().Elem())
+			merge(x.Elem(), src.Elem())
+			dest.Set(x)
+		}
+	default:
+		if !dest.CanSet() {
+			return nil
+		}
+		dest.Set(src)
+	}
+
+	return nil
+}
 
 // list of top level domains
 // https://www.iana.org/domains/root/db
@@ -311,42 +400,16 @@ func main() {
 
 	indexerChan := make(chan *Document)
 
-	go func() {
-		es, err := elastic.NewClient(elastic.SetURL(os.Getenv("ES_HOST")), elastic.SetSniff(false))
-		if err != nil {
+	f, err := os.Create("output.json")
+	defer func() {
+		if err := f.Close(); err != nil {
 			panic(err)
 		}
+	}()
 
-		log.Info("Indexer started")
+	w := bufio.NewWriter(f)
 
-		count := 0
-
-		bulk := es.Bulk()
-
-		flush := func() {
-			if response, err := bulk.Do(context.Background()); err != nil {
-				log.Error("Error indexing: ", err.Error())
-			} else {
-				indexed := response.Indexed()
-				count += len(indexed)
-
-				if response.Errors {
-					for _, item := range indexed {
-						if item.Error != nil {
-							continue
-						}
-
-						log.Error(item.Error)
-					}
-
-				}
-
-				//rate := float64(count) / time.Now().Sub(start).Minutes()
-				log.Infof("Bulk indexing: %d total %d.", len(indexed), count)
-			}
-		}
-
-		defer flush()
+	go func() {
 
 		ticker := time.After(time.Second * 5)
 
@@ -355,27 +418,17 @@ func main() {
 			select {
 
 			case doc := <-indexerChan:
-				// timestamp en index ook interessant
-
-				// Merge(&doc.Certificate, *m.Certificate)
-
-				// parse domain names for extension
-				// ping ip adresses?
-				// retrieve analytics code?
-				bulk = bulk.Add(elastic.NewBulkIndexRequest().
-					Index("ctdb").
-					Type("certificate").
-					Id(doc.Key).
-					Doc(doc),
-				)
-
-				if bulk.NumberOfActions() < 100 {
-					continue
+				jsonCertificate, err := json.Marshal(doc.Certificate)
+				if err != nil {
+					fmt.Println("error:", err)
 				}
+				if _, err := w.Write(jsonCertificate); err != nil {
+					panic(err)
+				}
+				w.WriteRune('\n')
+				w.Flush()
 			case <-ticker:
 			}
-
-			flush()
 		}
 
 	}()
